@@ -1,0 +1,144 @@
+name: vmaf
+title: VMAF
+summary: Scores the quality of an encoded video against its source with Netflix's VMAF, and computes PSNR, SSIM, MS-SSIM, CIEDE2000 and CAMBI.
+homepage: https://github.com/Netflix/vmaf
+# VMAF (BSD-2-Clause-Patent) and the code it compiles in: libsvm and the
+# SSIM code from IQA (BSD-3-Clause), the PSNR-HVS code from Xiph, the Y4M
+# reader from Daala and the CPU detection from dav1d (BSD-2-Clause),
+# x86inc.asm from x264 (ISC), mkdirp and the CIEDE2000 code ported from
+# av-metrics (MIT), and the pdjson JSON parser (Unlicense).
+license: BSD-2-Clause-Patent AND BSD-2-Clause AND BSD-3-Clause AND ISC AND MIT AND Unlicense
+upstream:
+  source: github-release
+  repository: Netflix/vmaf
+  # Release tags look like v3.2.1; the v3.0.0-rc pre-release does not match.
+  # Releases are read instead of tags because a tag can be created weeks
+  # before its release.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.2.1
+  # Releases attach prebuilt binaries but no source tarball or checksums, so
+  # the build clones the tag and checks its commit.
+  git:
+    url: https://github.com/Netflix/vmaf.git
+    tag: v{version}
+    commit: f85a853692a8c730d0270cd733c8bb30b5b93b7c
+image:
+  entrypoint: [vmaf]
+  # vmaf has no help option (-h is --height); it prints its usage on errors.
+  cmd: [--version]
+test:
+  - |
+    vmaf --version > version.txt 2>&1
+    v=$(cat version.txt)
+    hash=${v#"$VERSION-0-g"}
+    if [ "$hash" = "$v" ] || ! printf '%s\n' "$hash" | grep -Eqx '[0-9a-f]{7,40}'; then
+      echo "expected $VERSION-0-g<commit>, got: $v" >&2
+      exit 1
+    fi
+  - |
+    # Four 640x480 frames of a 62-byte pattern that moves 3 bytes from frame
+    # to frame, as Y4M and as raw YUV. dist posterizes the letters to four
+    # levels. CAMBI needs a side of 216 pixels or more, MS-SSIM both sides
+    # of 176 or more.
+    frames() {
+      p=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+      for _ in 1 2 3 4; do
+        if [ "$1" = y4m ]; then printf 'FRAME\n'; fi
+        yes "$p" | tr -d '\n' | head -c 460800 | tr "$2" "$3"
+        p=${p#???}${p%"${p#???}"}
+      done
+    }
+    post=aaaaaaaaaaaaannnnnnnnnnnnnAAAAAAAAAAAAANNNNNNNNNNNNN
+    { printf 'YUV4MPEG2 W640 H480 F25:1 Ip A1:1 C420jpeg\n'; frames y4m a a; } > ref.y4m
+    { printf 'YUV4MPEG2 W640 H480 F25:1 Ip A1:1 C420jpeg\n'; frames y4m a-zA-Z "$post"; } > dist.y4m
+    frames yuv a a > ref.yuv
+    frames yuv a-zA-Z "$post" > dist.yuv
+    size=$(wc -c < ref.y4m)
+    test "$size" -eq 1843267 || { echo "ref.y4m has $size bytes, expected 1843267" >&2; exit 1; }
+    # Without a TTY vmaf prints no score, so every run writes a report.
+    vmaf -r ref.y4m -d ref.y4m --feature psnr -o same.xml 2> same.log || { cat same.log >&2; exit 1; }
+    vmaf -r ref.y4m -d dist.y4m -o dist.xml 2> dist.log || { cat dist.log >&2; exit 1; }
+    mean() { sed -n "s/.*<metric name=\"$1\" .* mean=\"\([0-9.]*\)\".*/\1/p" "$2"; }
+    psnr=$(mean psnr_y same.xml)
+    same=$(mean vmaf same.xml)
+    dist=$(mean vmaf dist.xml)
+    if [ "$psnr" != 60.000000 ]; then
+      echo "expected a PSNR of 60.000000 for identical inputs, got '$psnr'" >&2
+      exit 1
+    fi
+    if ! awk -v a="$same" -v b="$dist" 'BEGIN { exit !(a != "" && b != "" && a + 0 > b + 0) }'; then
+      echo "expected a lower VMAF for the posterized copy, got '$same' unchanged and '$dist' posterized" >&2
+      exit 1
+    fi
+  - |
+    # The VMAF v1 model for 1080p and the floating-point v0.6.1 model are
+    # built in. Each model in a run needs its own name.
+    vmaf -r ref.y4m -d dist.y4m -o models.xml \
+      --model version=vmaf_v1.0.16_3d0h:name=v1 --model version=vmaf_float_v0.6.1:name=float \
+      2> models.log || { cat models.log >&2; exit 1; }
+    for m in v1 float; do
+      if ! grep -Eq "<metric name=\"$m\" .* mean=\"[0-9]+\.[0-9]+\"" models.xml; then
+        echo "no $m score in models.xml:" >&2
+        grep '<metric' models.xml >&2
+        exit 1
+      fi
+    done
+  - |
+    vmaf -r ref.y4m -d dist.y4m --feature float_ssim --feature float_ms_ssim --feature ciede --feature cambi \
+      --json -o features.json 2> features.log || { cat features.log >&2; exit 1; }
+    for key in vmaf float_ssim float_ms_ssim ciede2000 cambi; do
+      grep -Fq "\"$key\": {" features.json || { echo "no pooled $key score in features.json" >&2; exit 1; }
+    done
+  - |
+    # The same frames as raw YUV give the same score as the Y4M files.
+    vmaf -r ref.yuv -d dist.yuv --width 640 --height 480 --pixel_format 420 --bitdepth 8 -o raw.xml \
+      2> raw.log || { cat raw.log >&2; exit 1; }
+    mean() { sed -n 's/.*<metric name="vmaf" .* mean="\([0-9.]*\)".*/\1/p' "$1"; }
+    raw=$(mean raw.xml)
+    y4m=$(mean dist.xml)
+    if [ -z "$raw" ] || [ "$raw" != "$y4m" ]; then
+      echo "expected the Y4M score '$y4m' for raw YUV, got '$raw'" >&2
+      exit 1
+    fi
+  - |
+    { printf 'YUV4MPEG2 W320 H240 F25:1 Ip A1:1 C420jpeg\nFRAME\n'; head -c 115200 /dev/zero; } > small.y4m
+    if vmaf -r ref.y4m -d small.y4m -o mismatch.xml 2> mismatch.log; then
+      echo "vmaf compared a 640x480 video with a 320x240 one" >&2
+      exit 1
+    fi
+    grep -Fq 'dimensions do not match: 640x480, 320x240' mismatch.log || { cat mismatch.log >&2; exit 1; }
+examples:
+  - title: Score a distorted Y4M video against its reference and write the result as JSON
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/vmaf -r reference.y4m -d distorted.y4m --json -o vmaf.json
+  - title: Add PSNR, SSIM and MS-SSIM to the report
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/vmaf -r reference.y4m -d distorted.y4m --feature psnr --feature float_ssim --feature float_ms_ssim --json -o vmaf.json
+  - title: Score 1080p video with the VMAF v1 model
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/vmaf -r reference.y4m -d distorted.y4m --model version=vmaf_v1.0.16_3d0h --json -o vmaf.json
+  - title: Score raw 8-bit 4:2:0 YUV files
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/vmaf -r reference.yuv -d distorted.yuv --width 1920 --height 1080 --pixel_format 420 --bitdepth 8 -o vmaf.xml
+  - title: Score an encode against its source, both decoded by FFmpeg (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/vmaf -c 'ffmpeg -loglevel error -y -i source.mp4 -pix_fmt yuv420p -f yuv4mpegpipe reference.y4m && ffmpeg -loglevel error -y -i encoded.mp4 -pix_fmt yuv420p -f yuv4mpegpipe distorted.y4m && vmaf -r reference.y4m -d distorted.y4m --json -o vmaf.json'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: VMAF with FFmpeg, which decodes encoded videos to the Y4M input that vmaf reads.
+    test:
+      - |
+        run() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+        src=testsrc2=size=320x240:rate=25:duration=2
+        run -f lavfi -i "$src" -pix_fmt yuv420p -f yuv4mpegpipe source.y4m
+        for crf in 18 45; do
+          run -f lavfi -i "$src" -c:v libx264 -crf "$crf" -pix_fmt yuv420p "crf$crf.mp4"
+          run -i "crf$crf.mp4" -pix_fmt yuv420p -f yuv4mpegpipe "crf$crf.y4m"
+          vmaf -r source.y4m -d "crf$crf.y4m" -o "crf$crf.xml" 2> "crf$crf.log" || { cat "crf$crf.log" >&2; exit 1; }
+        done
+        mean() { sed -n 's/.*<metric name="vmaf" .* mean="\([0-9.]*\)".*/\1/p' "$1"; }
+        good=$(mean crf18.xml)
+        poor=$(mean crf45.xml)
+        if ! awk -v a="$good" -v b="$poor" 'BEGIN { exit !(a != "" && b != "" && a + 0 > 80 && a + 0 > b + 0) }'; then
+          echo "expected a VMAF above 80 at CRF 18 and a lower one at CRF 45, got '$good' and '$poor'" >&2
+          exit 1
+        fi
