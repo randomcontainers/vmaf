@@ -1,0 +1,171 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base. xxd turns the built-in models into C sources, and
+# nasm assembles the x86 CPU detection.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      git \
+      meson \
+      nasm \
+      ninja-build \
+      xxd \
+ && rm -rf /var/lib/apt/lists/*
+
+# VMAF releases attach prebuilt binaries but no source tarball or checksums,
+# so the release tag is cloned and must point to the commit pinned in
+# package.yml. The version that vmaf prints comes from git describe, which
+# only matches tags without the v prefix: the local tag makes it print
+# <version>-0-g<commit>. meson runs git during the build, so .git stays.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN set -eu; \
+    printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/Netflix/vmaf.git /src/vmaf; \
+    test "$(git -C /src/vmaf rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    git -C /src/vmaf tag "${VERSION}"
+
+ARG JOBS
+# libvmaf is linked statically into the vmaf tool, so the image ships no
+# library of its own. enable_float adds the floating-point features and
+# models, such as float_ssim, float_ms_ssim and vmaf_float_v0.6.1.
+RUN set -eu; \
+    meson setup /build /src/vmaf/libvmaf \
+      --prefix=/usr/local \
+      --libdir=lib \
+      --buildtype=release \
+      --wrap-mode=nodownload \
+      -Ddefault_library=static \
+      -Denable_tools=true \
+      -Denable_tests=false \
+      -Denable_docs=false \
+      -Dbuilt_in_models=true \
+      -Denable_float=true \
+      -Denable_cuda=false \
+      -Denable_nvtx=false; \
+    ninja -C /build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out meson install -C /build --no-rebuild; \
+    rm -rf /out/usr/local/include /out/usr/local/lib; \
+    strip /out/usr/local/bin/vmaf
+
+ARG BASE_IMAGE
+# meson leaves out the built-in models when xxd is missing and falls back to
+# the version in meson.build when git describe fails, without an error, so both
+# are checked here, along with the AVX-512 code on x86-64 and the NEON code on
+# arm64. The license notices of the code that VMAF compiles in from other
+# projects are cut from the top of their sources. mkdirp's notice names the MIT
+# license without its text, which is taken from the av-metrics notice; pdjson
+# has no notice, and its text is in licenses/. runtime-deps lists the packages
+# that own the libraries vmaf loads, minus the base image's packages, plus the
+# packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    set -eu; \
+    vmaf=/out/usr/local/bin/vmaf; \
+    v="$("$vmaf" --version 2>&1)"; \
+    hash="${v#"${VERSION}-0-g"}"; \
+    if [ "$hash" = "$v" ] || ! printf '%s\n' "$hash" | grep -Eqx '[0-9a-f]{7,40}' \
+      || [ "${SOURCE_COMMIT#"$hash"}" = "${SOURCE_COMMIT}" ]; then \
+      echo "vmaf --version printed ${v}, expected ${VERSION}-0-g<start of ${SOURCE_COMMIT}>" >&2; \
+      exit 1; \
+    fi; \
+    case "$(uname -m)" in \
+      x86_64) simd=HAVE_AVX512 ;; \
+      aarch64) simd=ARCH_AARCH64 ;; \
+      *) echo "unexpected architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    grep -Fqx "#define ${simd} 1" /build/src/config.h \
+      || { cat /build/src/config.h >&2; echo "${simd} is not set" >&2; exit 1; }; \
+    { \
+      printf 'YUV4MPEG2 W640 H480 F25:1 Ip A1:1 C420jpeg\n'; \
+      for _ in 1 2 3; do printf 'FRAME\n'; head -c 460800 /dev/urandom; done; \
+    } > /tmp/check.y4m; \
+    "$vmaf" -r /tmp/check.y4m -d /tmp/check.y4m -o /tmp/check.xml; \
+    grep -Fq '<metric name="vmaf" ' /tmp/check.xml; \
+    for model in vmaf_v1.0.16_3d0h vmaf_float_v0.6.1; do \
+      "$vmaf" -r /tmp/check.y4m -d /tmp/check.y4m --model "version=${model}" -o "/tmp/${model}.xml"; \
+      grep -Fq '<metric name="vmaf" ' "/tmp/${model}.xml"; \
+    done; \
+    meta=/out/usr/local/share/randomcontainers/vmaf; \
+    lic="$meta/licenses"; \
+    src=/src/vmaf/libvmaf; \
+    mkdir -p "$lic"; \
+    cp /src/vmaf/LICENSE "$lic/LICENSE"; \
+    awk '/^;/ { print; next } { exit }' "$src/src/ext/x86/x86inc.asm" > "$lic/LICENSE.x264"; \
+    comment() { \
+      awk -v want="$1" '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ want) { printf "%s", b; exit } }' "$2"; \
+    }; \
+    comment Copyright "$src/src/svm.h" > "$lic/LICENSE.libsvm"; \
+    comment Copyright "$src/src/feature/iqa/ssim_tools.c" > "$lic/LICENSE.iqa"; \
+    comment Copyright "$src/src/feature/third_party/xiph/psnr_hvs.c" > "$lic/LICENSE.xiph"; \
+    comment Copyright "$src/src/x86/cpu.c" > "$lic/LICENSE.dav1d"; \
+    { comment Copyright "$src/tools/vidinput.c"; echo; comment Copyright "$src/tools/y4m_input.c"; } > "$lic/LICENSE.daala"; \
+    comment 'MIT License' "$src/src/feature/ciede.c" > "$lic/LICENSE.av-metrics"; \
+    { \
+      awk '/^\/\// { c = 1; print; next } c { exit }' "$src/src/feature/mkdirp.c"; \
+      echo; \
+      sed -n '/^Permission is hereby granted/,/^SOFTWARE\.$/p' "$src/src/feature/ciede.c"; \
+    } > "$lic/LICENSE.mkdirp"; \
+    cp /tmp/licenses.extra/pdjson-UNLICENSE "$lic/UNLICENSE.pdjson"; \
+    grep -q 'x264 project' "$lic/LICENSE.x264"; \
+    grep -q 'Chih-Jen Lin' "$lic/LICENSE.libsvm"; \
+    grep -q 'Tom Distler' "$lic/LICENSE.iqa"; \
+    grep -q 'Xiph.Org' "$lic/LICENSE.xiph"; \
+    grep -q 'dav1d authors' "$lic/LICENSE.dav1d"; \
+    test "$(grep -c 'Daala project contributors' "$lic/LICENSE.daala")" -eq 2; \
+    grep -q 'Joshua Holmer' "$lic/LICENSE.av-metrics"; \
+    grep -q 'Stephen Mathieson' "$lic/LICENSE.mkdirp"; \
+    grep -q 'WITHOUT WARRANTY OF ANY KIND' "$lic/LICENSE.mkdirp"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/Netflix/vmaf.git@${SOURCE_COMMIT}" \
+      "https://github.com/Netflix/vmaf/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "meson: $(meson --version)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "vmaf --version: ${v}"; \
+      echo "config.h:"; \
+      grep -E '^#define [A-Z0-9_]+ [01]$' /build/src/config.h | sed 's/^#define /  /'; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f -perm -u+x -print0 | xargs -0 ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/vmaf/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "vmaf"]
+CMD ["--version"]
