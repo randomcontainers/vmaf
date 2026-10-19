@@ -161,7 +161,7 @@ VMAF is released under the [BSD-2-Clause-Patent license](https://github.com/Netf
 
 The default image adds FFmpeg, licensed under GPL-3.0-or-later; see [randomcontainers/ffmpeg](https://github.com/randomcontainers/ffmpeg#licenses) for its sources and license files. libstdc++ and the other libraries from Ubuntu or Alpine keep their own licenses. The SBOM lists them.
 
-The files in this repository are available under the MIT license, see [LICENSE](LICENSE).
+The files in this repository are available under the MIT license, see [LICENSE](LICENSE), except the license texts in `licenses/`, which keep their own terms.
 
 ## Requesting a tool
 
